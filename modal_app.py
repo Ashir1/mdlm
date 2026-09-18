@@ -13,9 +13,13 @@ Usage, from the repository root:
 command in the repository instead. The Hugging Face cache and
 `/root/outputs` live on persistent volumes, so checkpoints, tokenizers
 and Hydra run directories survive across runs. Set MDLM_MODAL_GPU
-(default A10G) to pick the GPU; flash-attn needs an Ampere or newer card.
+(default A10G; `none` for a CPU-only job) to pick the GPU (flash-attn
+needs an Ampere or newer card), MDLM_MODAL_CPU / MDLM_MODAL_MEMORY_GB
+(defaults 4 / 16) for the reserved cores and memory. Long jobs:
+`modal run --detach ...` keeps running if the client disconnects.
 """
 import os
+import shutil
 import subprocess
 
 import modal
@@ -24,6 +28,12 @@ REMOTE_ROOT = '/root/mdlm'
 HF_CACHE = '/root/.cache/huggingface'
 OUTPUTS = '/root/outputs'
 GPU = os.environ.get('MDLM_MODAL_GPU', 'A10G')
+if GPU.lower() in ('', 'none'):
+  GPU = None  # CPU-only job, e.g. dataset preparation
+# Reserved CPU cores / memory are billed; training needs little of
+# either, dataset tokenization (one process per core) wants more.
+CPU = int(os.environ.get('MDLM_MODAL_CPU', '4'))
+MEMORY_GB = int(os.environ.get('MDLM_MODAL_MEMORY_GB', '16'))
 
 # Prebuilt CUDA extensions matching torch 2.2 / CUDA 12 / Python 3.10
 # (the versions pinned in requirements.yaml).
@@ -82,13 +92,14 @@ outputs = modal.Volume.from_name('mdlm-relay-outputs',
 
 @app.function(image=image,
               gpu=GPU,
-              cpu=8,  # dataset tokenization uses one process per CPU
-              memory=32 * 1024,
+              cpu=CPU,
+              memory=MEMORY_GB * 1024,
               timeout=24 * 60 * 60,
               volumes={HF_CACHE: hf_cache, OUTPUTS: outputs})
 def run(command: str) -> None:
-  subprocess.run(['nvidia-smi', '--query-gpu=name,memory.total',
-                  '--format=csv'], check=False)
+  if shutil.which('nvidia-smi'):  # absent in CPU-only containers
+    subprocess.run(['nvidia-smi', '--query-gpu=name,memory.total',
+                    '--format=csv'], check=False)
   try:
     subprocess.run(command, shell=True, cwd=REMOTE_ROOT, check=True)
   finally:

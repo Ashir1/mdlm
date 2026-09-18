@@ -405,10 +405,20 @@ python main.py mode=sample_eval backbone=dit relay.enabled=true \
 - **Memory.** `L1 + L2` keeps two full DIT graphs alive (forward 1 through `h1`). Expect ~2× the
   activation memory of a normal MDLM step at the same per-GPU batch; start at `loader.batch_size=8`
   on 40–80 GB cards. Per-block `torch.utils.checkpoint` is the fallback (not in `DDiTBlock` today).
-- **Throughput and data exposure.** One row needs `(T+1)/K ≈ 65` calls at `T=128`; a buffer of 8
-  rows therefore admits ~0.12 fresh sequences per step. Fine for OWT (8M docs) but plan
-  `max_steps` in *calls*, not sequences. Smaller training `T` (32/64) or sampling `T` per row from a
-  set trades trajectory fidelity for diversity — keep as a later knob.
+- **Measured throughput (A100-80GB, L=1024, `precision=bf16`, DDP, 2026-09-18).** Relay K=2 at
+  B=16: 465 ms/step = **69 block-passes/s** (peak 43 GiB; B=24 fits at 60 GiB, B=32 OOMs); plain
+  MDLM at B=16: 253 ms/step = 63 block-passes/s. That is ≈ 60 TFLOPS ≈ 20 % MFU: the fp32
+  50k-vocab head / SUBS is the limiter, not batch size (a masked-positions-only, bf16 loss head is
+  the obvious 2–3× lever). One row costs `T+1` block-passes, so one pass over OWT (8.7 M blocks)
+  is 8.7 M × (T+1) / 69 GPU-s: T=128 → 4.5 k A100-h (~$11 k at $2.50/h), T=32 → 1.2 k h, T=16 →
+  0.6 k h; a plain MDLM epoch is 38 h (~$100); a Fast-dLLM-style adaptation (20 k steps × 64 rows ×
+  K=2) is ~10 A100-h (~$26). Plan `max_steps` in calls, not sequences: a buffer of B rows admits
+  B/ceil((T+1)/K) fresh sequences per call. `scripts/profile_step.py` reproduces the numbers (step
+  profiler + `StepTimer` Lightning callback).
+- **Keep the tokenizer out of `hparams`** (`save_hyperparameters(ignore=['tokenizer'])`): with the
+  CSV logger every metrics flush rewrote `hparams.yaml`, pickling the tokenizer through PyYAML —
+  0.3–0.65 s per step and growing, which halved throughput. Per-step relay diagnostics are logged
+  with `sync_dist=False`. Reusing a `hydra.run.dir` auto-resumes from its `last.ckpt`.
 - **Incoming rows are dropped** when no slot is ready (both references do this). Don't queue them.
 - **Nothing runs locally.** The Windows dev box has no `flash_attn`; every run (parity, training,
   sampling, tests) goes through `modal_app.py`. No CPU/Windows fallbacks are kept in the code.
