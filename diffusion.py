@@ -4,9 +4,11 @@ import os
 import typing
 from dataclasses import dataclass
 
+import huggingface_hub
 import hydra.utils
 import lightning as L
 import numpy as np
+import safetensors.torch
 import torch
 import torch.nn.functional as F
 import torchmetrics
@@ -16,6 +18,7 @@ from torch import Tensor
 import dataloader
 import models
 import noise_schedule
+import relay_loss
 import utils
 
 LOG2 = math.log(2)
@@ -71,7 +74,10 @@ class Diffusion(L.LightningModule):
     config,
     tokenizer: transformers.PreTrainedTokenizer):
     super().__init__()
-    self.save_hyperparameters()
+    # The tokenizer is passed explicitly to `load_from_checkpoint`;
+    # keeping it out of hparams avoids pickling it into hparams.yaml
+    # on every logger flush (seconds per flush with the CSV logger).
+    self.save_hyperparameters(ignore=['tokenizer'])
     self.config = config
 
     self.tokenizer = tokenizer
@@ -91,7 +97,8 @@ class Diffusion(L.LightningModule):
     self.parameterization = self.config.parameterization
     if self.config.backbone == 'dit':
       self.backbone = models.dit.DIT(
-        self.config, vocab_size=self.vocab_size)
+        self.config, vocab_size=self.vocab_size,
+        mask_index=self.mask_index)
     elif self.config.backbone == 'dimamba':
       self.backbone = models.dimamba.DiMamba(
         self.config,
@@ -147,6 +154,12 @@ class Diffusion(L.LightningModule):
     self.lr = self.config.optim.lr
     self.sampling_eps = self.config.training.sampling_eps
     self.time_conditioning = self.config.time_conditioning
+    relay_config = self.config.get('relay', None)
+    self.relay_enabled = bool(relay_config is not None
+                              and relay_config.enabled)
+    if self.relay_enabled:
+      self.relay_loss = relay_loss.RelayRolloutLoss(self, relay_config)
+    self.nfe = 0  # forward calls of the last `_sample`
     self.neg_infinity = -1000000.0
     self.fast_forward_epochs = None
     self.fast_forward_batches = None
@@ -164,6 +177,57 @@ class Diffusion(L.LightningModule):
       assert self.parameterization in {'d3pm', 'subs'}
     if self.subs_masking:
       assert self.parameterization == 'd3pm'
+    if self.relay_enabled:
+      # The relay lives in models/dit.py; `hf_dit` loads the remote
+      # implementation, which would silently ignore it.
+      assert self.config.backbone == 'dit'
+      assert self.parameterization == 'subs'
+      assert self.T == 0
+      assert self.config.relay.num_rollout_steps >= 1
+      assert self.config.relay.num_steps >= 1
+    if self.sampler == 'relay_ddpm':
+      assert self.relay_enabled
+
+  def load_pretrained_backbone(self, path):
+    """Initializes the backbone from a pretrained MDLM checkpoint.
+
+    Args:
+      path: Hugging Face repo id (e.g. `kuleshov-group/mdlm-owt`),
+        a local `model.safetensors`, or a Lightning `.ckpt`.
+
+    Every backbone parameter of the checkpoint must match this
+    model; parameters that only exist here (the relay) keep their
+    initialization. The EMA is re-created so that its shadow
+    parameters track the loaded weights instead of the random
+    initialization they were cloned from in `__init__`.
+    """
+    if path.endswith('.ckpt'):
+      state_dict = torch.load(
+        path, map_location='cpu', weights_only=False)['state_dict']
+    else:
+      if not path.endswith('.safetensors'):
+        path = huggingface_hub.hf_hub_download(
+          path, 'model.safetensors')
+      state_dict = safetensors.torch.load_file(path)
+    state_dict = {k: v for k, v in state_dict.items()
+                  if k.startswith('backbone.')}
+    missing, unexpected = self.load_state_dict(
+      state_dict, strict=False)
+    assert not unexpected, (
+      f'Unexpected keys in pretrained checkpoint: {unexpected}')
+    parameters = {name for name, _ in self.named_parameters()}
+    relay_parameters = {name for name in parameters
+                        if '.relay_ln.' in name}
+    missing_parameters = set(missing) & parameters
+    assert missing_parameters <= relay_parameters, (
+      'Pretrained checkpoint is missing parameters: '
+      f'{sorted(missing_parameters - relay_parameters)}')
+    if self.ema:
+      self.ema = models.ema.ExponentialMovingAverage(
+        itertools.chain(self.backbone.parameters(),
+                        self.noise.parameters()),
+        decay=self.config.training.ema)
+    return missing, unexpected
 
   def on_load_checkpoint(self, checkpoint):
     if self.ema:
@@ -258,6 +322,30 @@ class Diffusion(L.LightningModule):
         self.backbone.parameters(),
         self.noise.parameters()))
 
+  def on_after_backward(self):
+    # Relay diagnostic: the share of the gradient that reaches the
+    # relay parameters.
+    if not (self.relay_enabled and self.config.relay.use_state):
+      return
+    if self.global_step % self.trainer.log_every_n_steps != 0:
+      return
+    relay_norm_sq = torch.zeros((), device=self.device)
+    backbone_norm_sq = torch.zeros((), device=self.device)
+    for name, param in self.backbone.named_parameters():
+      if param.grad is None:
+        continue
+      norm_sq = param.grad.detach().float().pow(2).sum()
+      if 'relay_ln' in name:
+        relay_norm_sq += norm_sq
+      else:
+        backbone_norm_sq += norm_sq
+    self.log_dict({
+      'train/relay_grad_norm': relay_norm_sq.sqrt(),
+      'train/backbone_grad_norm': backbone_norm_sq.sqrt(),
+      'train/relay_to_backbone_grad_ratio': (
+        relay_norm_sq.sqrt() / backbone_norm_sq.sqrt().clamp(min=1e-12)),
+    }, on_step=True, on_epoch=False)
+
   def _subs_parameterization(self, logits, xt):
     # log prob at the mask index = - infinity
     logits[:, :, self.mask_index] += self.neg_infinity
@@ -309,22 +397,44 @@ class Diffusion(L.LightningModule):
     assert sigma.ndim == 1, sigma.shape
     return sigma
 
-  def forward(self, x, sigma):
-    """Returns log score."""
+  def _initial_relay_state(self, x):
+    """Relay state of a first denoising step: zeros, or None when the
+    model carries no state."""
+    if not (self.relay_enabled and self.config.relay.use_state):
+      return None
+    return torch.zeros(*x.shape, self.config.model.hidden_size,
+                       device=x.device)
+
+  def forward(self, x, sigma, h_prev=None, return_state=False):
+    """Returns log score.
+
+    With `return_state=True` also returns the relay state of the
+    backbone (see `models.dit.DIT.forward`), which the next
+    denoising step consumes through `h_prev`.
+    """
+    self.nfe += 1
     sigma = self._process_sigma(sigma)
     with torch.cuda.amp.autocast(dtype=torch.float32):
-      logits = self.backbone(x, sigma)
-    
+      if h_prev is not None or return_state:
+        logits, h_next = self.backbone(
+          x, sigma, h_prev=h_prev, return_state=True)
+      else:
+        logits, h_next = self.backbone(x, sigma), None
+
     if self.parameterization == 'subs':
-      return self._subs_parameterization(logits=logits,
-                                         xt=x)
+      output = self._subs_parameterization(logits=logits,
+                                           xt=x)
     elif self.parameterization == 'sedd':
-      return self._sedd_parameterization(logits=logits,
-                                         xt=x,
-                                         sigma=sigma)
+      output = self._sedd_parameterization(logits=logits,
+                                           xt=x,
+                                           sigma=sigma)
     elif self.parameterization == 'd3pm':
-      return self._d3pm_parameterization(logits=logits)
-    return logits
+      output = self._d3pm_parameterization(logits=logits)
+    else:
+      output = logits
+    if return_state:
+      return output, h_next
+    return output
 
   def _d3pm_loss(self, model_output, xt, x0, t):
     dt = 1 / self.T
@@ -388,7 +498,15 @@ class Diffusion(L.LightningModule):
     self.noise.train()
 
   def training_step(self, batch, batch_idx):
-    loss = self._compute_loss(batch, prefix='train')
+    if self.relay_enabled:
+      loss, metrics = self.relay_loss(batch, train=True)
+      # Per-rank diagnostics: no all-reduce per metric and step.
+      self.log_dict({f'train/relay_{k}': v for k, v in metrics.items()},
+                    on_step=True,
+                    on_epoch=False,
+                    sync_dist=False)
+    else:
+      loss = self._compute_loss(batch, prefix='train')
     self.log(name='trainer/loss',
              value=loss.item(),
              on_step=True,
@@ -410,7 +528,14 @@ class Diffusion(L.LightningModule):
     assert self.valid_metrics.nll.weight == 0
 
   def validation_step(self, batch, batch_idx):
-    return self._compute_loss(batch, prefix='val')
+    loss = self._compute_loss(batch, prefix='val')
+    if self.relay_enabled:
+      _, metrics = self.relay_loss(batch, train=False)
+      self.log_dict({f'val/relay_{k}': v for k, v in metrics.items()},
+                    on_step=False,
+                    on_epoch=True,
+                    sync_dist=True)
+    return loss
 
   def on_validation_epoch_end(self):
     if ((self.config.eval.compute_perplexity_on_sanity
@@ -426,6 +551,11 @@ class Diffusion(L.LightningModule):
         text_samples = self.tokenizer.batch_decode(samples)
         if self.config.eval.compute_generative_perplexity:
           self.compute_generative_perplexity(text_samples)
+      self.log('val/sampling_nfe',
+               float(self.nfe),
+               on_epoch=True,
+               on_step=False,
+               sync_dist=True)
       if self.trainer.global_rank == 0 and hasattr(
         self.trainer.logger, 'log_table'):
         # Log the last generated samples
@@ -663,6 +793,9 @@ class Diffusion(L.LightningModule):
     # Lightning auto-casting is not working in this method for some reason
     if num_steps is None:
       num_steps = self.config.sampling.steps
+    self.nfe = 0
+    if self.sampler == 'relay_ddpm':
+      return self._relay_sample(num_steps, eps)
     x = self._sample_prior(
       batch_size_per_gpu,
       self.config.model.length).to(self.device)
@@ -695,6 +828,36 @@ class Diffusion(L.LightningModule):
       else:
         unet_conditioning = self.noise(t)[0]
         x = self.forward(x, unet_conditioning).argmax(dim=-1)
+    return x
+
+  @torch.no_grad()
+  def _relay_sample(self, num_steps, eps=1e-5):
+    """Ancestral sampling that carries the relay state across steps.
+
+    The same Markov chain as `ddpm` (positions are revealed by
+    `relay_loss.Schedule`, tokens are drawn from p_x0), but every
+    step consumes the state returned by the previous one, and there
+    is no prediction cache. num_steps + 1 forwards with noise removal.
+    """
+    batch_size = self.config.loader.eval_batch_size
+    x = self._sample_prior(
+      batch_size, self.config.model.length).to(self.device)
+    h = self._initial_relay_state(x)
+    carry = h is not None
+    schedule = relay_loss.Schedule(self.noise, num_steps, eps)
+    step = torch.zeros(batch_size, dtype=torch.long, device=self.device)
+    for _ in range(num_steps):
+      log_p_x0, h_next = self.forward(
+        x, schedule.sigma(step), h_prev=h, return_state=True)
+      reveal = schedule.reveal(x == self.mask_index, step)
+      x = torch.where(reveal, _sample_categorical(log_p_x0.exp()), x)
+      step += 1
+      if carry:
+        h = h_next
+    if self.config.sampling.noise_removal:
+      log_p_x0, _ = self.forward(
+        x, schedule.sigma(step), h_prev=h, return_state=True)
+      x = torch.where(x == self.mask_index, log_p_x0.argmax(dim=-1), x)
     return x
 
   def restore_model_and_sample(self, num_steps, eps=1e-5):
@@ -864,7 +1027,8 @@ class Diffusion(L.LightningModule):
       move_chance = 1 - torch.exp(-sigma[:, None])
 
     xt = self.q_xt(x0, move_chance)
-    model_output = self.forward(xt, unet_conditioning)
+    model_output = self.forward(xt, unet_conditioning,
+                                h_prev=self._initial_relay_state(xt))
     utils.print_nans(model_output, 'model_output')
 
     if self.parameterization == 'sedd':

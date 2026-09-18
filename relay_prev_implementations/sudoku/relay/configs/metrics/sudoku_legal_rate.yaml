@@ -1,0 +1,6 @@
+_target_: xlm.metrics.MetricWrapper
+name: legal_rate
+metric:
+  _target_: torchmetrics.MeanMetric
+prefix: ??? # eg: val/prediction/, test/prediction/
+update_fn: relay.sudoku_metrics.sudoku_legal_rate_update_fn

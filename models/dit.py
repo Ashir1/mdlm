@@ -322,13 +322,14 @@ class DDitFinalLayer(nn.Module):
 
 
 class DIT(nn.Module, huggingface_hub.PyTorchModelHubMixin):
-  def __init__(self, config, vocab_size: int):
+  def __init__(self, config, vocab_size: int, mask_index=None):
     super().__init__()
     if type(config) == dict:
       config = omegaconf.OmegaConf.create(config)
 
     self.config = config
     self.vocab_size = vocab_size
+    self.mask_index = mask_index
 
     self.vocab_embed = EmbeddingLayer(config.model.hidden_size,
                                       vocab_size)
@@ -350,21 +351,59 @@ class DIT(nn.Module, huggingface_hub.PyTorchModelHubMixin):
       config.model.cond_dim)
     self.scale_by_sigma = config.model.scale_by_sigma
 
+    # Relay: the hidden state of the previous denoising step (the
+    # output of block `relay_layer`) is mapped by an affine LayerNorm
+    # and added to the embeddings of MASK tokens. The LayerNorm is
+    # zero-initialized, so a relay-enabled model reproduces the
+    # pretrained checkpoint exactly until the relay is trained.
+    relay_config = config.get('relay', None)
+    self.relay_enabled = bool(relay_config is not None
+                              and relay_config.enabled
+                              and relay_config.use_state)
+    relay_layer = relay_config.layer if self.relay_enabled else -1
+    self.relay_layer = relay_layer % config.model.n_blocks
+    if self.relay_enabled:
+      assert mask_index is not None, 'relay requires mask_index'
+      self.relay_ln = nn.LayerNorm(config.model.hidden_size)
+      self.relay_ln.weight.data.zero_()
+      self.relay_ln.bias.data.zero_()
+
   def _get_bias_dropout_scale(self):
     if self.training:
       return bias_dropout_add_scale_fused_train
     else:
       return  bias_dropout_add_scale_fused_inference
 
-  def forward(self, indices, sigma):
+  def forward(self, indices, sigma, h_prev=None, return_state=False):
+    """Returns logits, and with `return_state` also the relay state.
+
+    Args:
+      indices: int tensor with shape (batch_size, length).
+      sigma: float tensor with shape (batch_size,).
+      h_prev: relay state of the previous denoising step, float
+        tensor with shape (batch_size, length, hidden_size). Only
+        affects MASK positions. `None` disables the relay.
+      return_state: also return the output of block `relay_layer`,
+        i.e. the state to pass as `h_prev` to the next step.
+    """
     x = self.vocab_embed(indices)
+    if h_prev is not None:
+      assert self.relay_enabled, 'h_prev given but relay is disabled'
+      relay = self.relay_ln(h_prev.to(x.dtype))
+      x = torch.where((indices == self.mask_index)[..., None],
+                      x + relay, x)
     c = F.silu(self.sigma_map(sigma))
 
     rotary_cos_sin = self.rotary_emb(x)
 
+    h_next = None
     with torch.cuda.amp.autocast(dtype=torch.bfloat16):
       for i in range(len(self.blocks)):
         x = self.blocks[i](x, rotary_cos_sin, c, seqlens=None)
+        if i == self.relay_layer:
+          h_next = x
       x = self.output_layer(x, c)
 
+    if return_state:
+      return x, h_next
     return x

@@ -1,0 +1,15 @@
+# @package _global_
+defaults:
+  - default
+  - /datasets@datamodule.dataset_managers.train.lm: sudoku_extreme_train
+  - /datasets@datamodule.dataset_managers.val.lm: sudoku_extreme_val
+  - /datasets@datamodule.dataset_managers.val.infill_prediction: sudoku_extreme_val
+  - /collator@datamodule.dataset_managers.train.lm.collator: puzzle_mlm
+  - /collator@datamodule.dataset_managers.val.lm.collator: puzzle_mlm
+  - /collator@datamodule.dataset_managers.val.infill_prediction.collator: puzzle_infill_pred
+
+datamodule:
+  print_batch_fn: relay.datamodule.print_batch
+
+tags:
+  dataset: sudoku_extreme

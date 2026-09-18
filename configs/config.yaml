@@ -7,13 +7,24 @@ defaults:
   - /noise: loglinear
   - /lr_scheduler: constant_warmup
 
-mode: train  # train / ppl_eval / sample_eval
+mode: train  # train / ppl_eval / sample_eval / parity_check
 diffusion: absorbing_state
 backbone: dit  # dit / dimamba / ar
 parameterization: subs  # subs / d3pm / sedd
 time_conditioning: False
 T: 0  # 0 (continuous time) / 1000 
 subs_masking: False
+relay:
+  # Relay adaptation (see RELAY_PLAN.md): the hidden state of the
+  # previous denoising step is carried into the MASK-token embeddings,
+  # and training unmasks sequences step by step like the sampler does.
+  enabled: False
+  use_state: True  # False: rollout training without the relay (ablation)
+  layer: -1  # DDiT block whose output is the relay state (-1 = last)
+  num_rollout_steps: 2  # denoising steps per training call; the state is backpropagated between them
+  stop_grad_state: False  # detach the state between the steps instead (RELAY-sg)
+  num_steps: ${sampling.steps}  # denoising steps of a training trajectory (the sampler's grid)
+  cold_start_stagger: True  # start the buffer rows at random positions of the schedule
 
 seed: 1
 
@@ -27,7 +38,7 @@ loader:
   pin_memory: True
 
 sampling:
-  predictor: ddpm_cache  # analytic, ddpm, ddpm_cache
+  predictor: ddpm_cache  # analytic, ddpm, ddpm_cache, relay_ddpm (carries the relay state)
   steps: 128
   noise_removal: True
   # TODO(yair): @subham, why aren't these params under `eval`?
@@ -43,6 +54,10 @@ training:
   importance_sampling: False
   sampling_eps: 1e-3
   change_of_variables: False
+  # Initialize the backbone from a pretrained MDLM before training:
+  # a Hugging Face repo id (kuleshov-group/mdlm-owt), a local
+  # model.safetensors, or a Lightning .ckpt. Ignored when resuming.
+  init_from_pretrained: null
 
 eval:
   checkpoint_path: ''  # Used to evaluate a checkpoint after training.

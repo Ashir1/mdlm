@@ -1,0 +1,112 @@
+# @package _global_
+defaults:
+  - /metrics@reported_metrics.val.infill_prediction.exact_match: exact_match
+  - /metrics@reported_metrics.val.infill_prediction.token_accuracy: token_accuracy
+  - /metrics@reported_metrics.val.infill_prediction.rollout_steps: rollout_steps
+  - /metrics@reported_metrics.val.infill_prediction.legal_rate: sudoku_legal_rate
+  - /metrics@reported_metrics.test.infill_prediction.exact_match: exact_match
+  - /metrics@reported_metrics.test.infill_prediction.token_accuracy: token_accuracy
+  - /metrics@reported_metrics.test.infill_prediction.rollout_steps: rollout_steps
+  - /metrics@reported_metrics.test.infill_prediction.legal_rate: sudoku_legal_rate
+  - override /datamodule: sudoku_extreme
+  - override /model_type: mlm
+  - override /model: rotary_transformer_xtiny
+
+per_device_batch_size: 512
+global_batch_size: 512
+block_size: 81
+monitored_metric: val/lm/accumulated_loss
+
+datamodule:
+  print_batch_fn: relay.datamodule.print_batch
+
+global_components:
+  tokenizer:
+    _target_: xlm.datamodule.SimpleSpaceTokenizer.for_numbers
+    vocab_size: 10
+
+predictor:
+  _target_: relay.predictor.ConfidenceBasedPredictor
+  max_steps: 64  # Max cells to fill (81 - 17 min clues = 64)
+  top_k: 1
+  top_p: null
+  confidence: top_prob
+  threshold: 0.15
+  log_rollout_diagnostics: true
+  log_rollout_diagnostics_max_steps: 64
+
+log_predictions:
+  _target_: xlm.log_predictions.LogPredictions
+  fields_to_keep_in_output:
+    - text
+    - truth
+    - inference_steps
+  inject_target: target_ids
+  writers:
+    - file
+    - logger
+
+trainer:
+  max_steps: 120_000
+  val_check_interval: 5_000  # Validate every 5,000 steps
+  check_val_every_n_epoch: null
+  num_sanity_val_steps: 1  # Run sanity validation before training
+  limit_val_batches: 100  # Only validate on 100 batches (~6400 examples) instead of full set
+  gradient_clip_val: 0.5  # Tighter clipping to reduce gradient spikes
+
+callbacks:
+  val_threshold_sweep:
+    _target_: relay.callbacks.ValidationThresholdSweepCallback
+    thresholds:
+      - 0.05
+      - 0.10
+      - 0.15
+      - 0.20
+      - 0.25
+    metric_prefix: val_sweep
+    prediction_dataloader_substring: prediction
+    extra_metrics:
+      legal_rate: relay.sudoku_metrics.sudoku_legal_mask
+
+optimizer:
+  lr: 0.0005
+
+lr_scheduler:
+  name: "constant_with_warmup"
+  num_warmup_steps: 2000  # Longer warmup for stability
+  num_training_steps: ${trainer.max_steps}
+  monitor: "train/loss"
+
+reported_metrics:
+  val:
+    infill_prediction:
+      exact_match:
+        prefix: val/prediction
+        update_fn: relay.metrics.exact_match_update_fn
+      token_accuracy:
+        prefix: val/prediction
+        update_fn: relay.metrics.infill_token_accuracy_update_fn
+      rollout_steps:
+        prefix: val/prediction
+        update_fn: relay.metrics.rollout_steps_update_fn
+      legal_rate:
+        prefix: val/prediction
+        update_fn: relay.sudoku_metrics.sudoku_legal_rate_update_fn
+  test:
+    infill_prediction:
+      exact_match:
+        prefix: test/prediction
+        update_fn: relay.metrics.exact_match_update_fn
+      token_accuracy:
+        prefix: test/prediction
+        update_fn: relay.metrics.infill_token_accuracy_update_fn
+      rollout_steps:
+        prefix: test/prediction
+        update_fn: relay.metrics.rollout_steps_update_fn
+      legal_rate:
+        prefix: test/prediction
+        update_fn: relay.sudoku_metrics.sudoku_legal_rate_update_fn
+
+loggers:
+  wandb:
+    project: BPTT-sudoku  # Your WandB project name

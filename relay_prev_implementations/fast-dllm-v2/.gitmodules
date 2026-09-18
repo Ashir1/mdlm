@@ -1,0 +1,6 @@
+[submodule "v2/lm-evaluation-harness"]
+	path = v2/lm-evaluation-harness
+	url = https://github.com/iesl/lm-evaluation-harness.git
+[submodule "v2/lib/lm-evalulation-harness"]
+	path = v2/lib/lm-evalulation-harness
+	url = https://github.com/iesl/lm-evaluation-harness.git

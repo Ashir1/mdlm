@@ -1,0 +1,2 @@
+_target_: relay.datamodule.PuzzleMLMCollator
+tokenizer: ${global_components:tokenizer}

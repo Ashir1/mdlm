@@ -1,0 +1,24 @@
+packaging
+numpy
+# EvalPlus 0.3.1 requires datasets>=2.21.0; upstream LMFlow pinned 2.14.6,
+# which made ``pip install -e '.[eval]'`` unsatisfiable. 2.21+ keeps HF loaders
+# used by prep/eval scripts compatible with transformers==4.53.1.
+datasets>=2.21.0,<3.0.0
+tokenizers>=0.13.3
+peft>=0.10.0
+torch>=2.0.1
+wandb
+deepspeed>=0.14.4
+sentencepiece
+transformers==4.53.1
+cpm_kernels==1.0.11
+evaluate==0.4.0
+bitsandbytes>=0.40.0
+pydantic
+accelerate>=0.27.2
+einops>=0.6.1
+pyarrow==18.0.0
+
+# EvalPlus is optional during training-only setups — install via:
+#   pip install -e '.[eval]'
+# so pip can satisfy EvalPlus's datasets constraint alongside core deps.
